@@ -24,7 +24,6 @@ import (
 	"time"
 
 	flag "github.com/spf13/pflag"
-	"helm.sh/helm/v3/pkg/getter"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
@@ -38,7 +37,6 @@ import (
 	ctrlcfg "sigs.k8s.io/controller-runtime/pkg/config"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
-	"github.com/fluxcd/pkg/git"
 	"github.com/fluxcd/pkg/runtime/client"
 	helper "github.com/fluxcd/pkg/runtime/controller"
 	"github.com/fluxcd/pkg/runtime/events"
@@ -55,12 +53,8 @@ import (
 
 	// +kubebuilder:scaffold:imports
 
-	"github.com/fluxcd/source-controller/internal/cache"
 	"github.com/fluxcd/source-controller/internal/controller"
 	intdigest "github.com/fluxcd/source-controller/internal/digest"
-	"github.com/fluxcd/source-controller/internal/features"
-	"github.com/fluxcd/source-controller/internal/helm"
-	"github.com/fluxcd/source-controller/internal/helm/registry"
 )
 
 const controllerName = "source-controller"
@@ -68,16 +62,6 @@ const controllerName = "source-controller"
 var (
 	scheme   = runtime.NewScheme()
 	setupLog = ctrl.Log.WithName("setup")
-	getters  = getter.Providers{
-		getter.Provider{
-			Schemes: []string{"http", "https"},
-			New:     getter.NewHTTPGetter,
-		},
-		getter.Provider{
-			Schemes: []string{"oci"},
-			New:     getter.NewOCIGetter,
-		},
-	}
 )
 
 func init() {
@@ -98,9 +82,6 @@ func main() {
 		storageAdvAddr           string
 		concurrent               int
 		requeueDependency        time.Duration
-		helmIndexLimit           int64
-		helmChartLimit           int64
-		helmChartFileLimit       int64
 		clientOptions            client.Options
 		logOptions               logger.Options
 		leaderElectionOptions    leaderelection.Options
@@ -108,9 +89,6 @@ func main() {
 		featureGates             feathelper.FeatureGates
 		watchOptions             helper.WatchOptions
 		intervalJitterOptions    jitter.IntervalOptions
-		helmCacheMaxSize         int
-		helmCacheTTL             string
-		helmCachePurgeInterval   string
 		artifactRetentionTTL     time.Duration
 		artifactRetentionRecords int
 		artifactDigestAlgo       string
@@ -128,24 +106,8 @@ func main() {
 	flag.StringVar(&storageAdvAddr, "storage-adv-addr", envOrDefault("STORAGE_ADV_ADDR", ""),
 		"The advertised address of the static file server.")
 	flag.IntVar(&concurrent, "concurrent", 2, "The number of concurrent reconciles per controller.")
-	flag.Int64Var(&helmIndexLimit, "helm-index-max-size", helm.MaxIndexSize,
-		"The max allowed size in bytes of a Helm repository index file.")
-	flag.Int64Var(&helmChartLimit, "helm-chart-max-size", helm.MaxChartSize,
-		"The max allowed size in bytes of a Helm chart file.")
-	flag.Int64Var(&helmChartFileLimit, "helm-chart-file-max-size", helm.MaxChartFileSize,
-		"The max allowed size in bytes of a file in a Helm chart.")
 	flag.DurationVar(&requeueDependency, "requeue-dependency", 30*time.Second,
 		"The interval at which failing dependencies are reevaluated.")
-	flag.IntVar(&helmCacheMaxSize, "helm-cache-max-size", 0,
-		"The maximum size of the cache in number of indexes.")
-	flag.StringVar(&helmCacheTTL, "helm-cache-ttl", "15m",
-		"The TTL of an index in the cache. Valid time units are ns, us (or µs), ms, s, m, h.")
-	flag.StringVar(&helmCachePurgeInterval, "helm-cache-purge-interval", "1m",
-		"The interval at which the cache is purged. Valid time units are ns, us (or µs), ms, s, m, h.")
-	flag.StringSliceVar(&git.KexAlgos, "ssh-kex-algos", []string{},
-		"The list of key exchange algorithms to use for ssh connections, arranged from most preferred to the least.")
-	flag.StringSliceVar(&git.HostKeyAlgos, "ssh-hostkey-algos", []string{},
-		"The list of hostkey algorithms to use for ssh connections, arranged from most preferred to the least.")
 	flag.DurationVar(&artifactRetentionTTL, "artifact-retention-ttl", 60*time.Second,
 		"The duration of time that artifacts from previous reconciliations will be kept in storage before being garbage collected.")
 	flag.IntVar(&artifactRetentionRecords, "artifact-retention-records", 2,
@@ -180,63 +142,10 @@ func main() {
 	probes.SetupChecks(mgr, setupLog)
 
 	metrics := helper.NewMetrics(mgr, metrics.MustMakeRecorder(), v1.SourceFinalizer)
-	cacheRecorder := cache.MustMakeMetrics()
 	eventRecorder := mustSetupEventRecorder(mgr, eventsAddr, controllerName)
 	storage := mustInitStorage(storagePath, storageAdvAddr, artifactRetentionTTL, artifactRetentionRecords, artifactDigestAlgo)
 
-	mustSetupHelmLimits(helmIndexLimit, helmChartLimit, helmChartFileLimit)
-	helmIndexCache, helmIndexCacheItemTTL := mustInitHelmCache(helmCacheMaxSize, helmCacheTTL, helmCachePurgeInterval)
-
 	ctx := ctrl.SetupSignalHandler()
-
-	if err := (&controller.GitRepositoryReconciler{
-		Client:         mgr.GetClient(),
-		EventRecorder:  eventRecorder,
-		Metrics:        metrics,
-		Storage:        storage,
-		ControllerName: controllerName,
-	}).SetupWithManagerAndOptions(mgr, controller.GitRepositoryReconcilerOptions{
-		DependencyRequeueInterval: requeueDependency,
-		RateLimiter:               helper.GetRateLimiter(rateLimiterOptions),
-	}); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", v1.GitRepositoryKind)
-		os.Exit(1)
-	}
-
-	if err := (&controller.HelmRepositoryReconciler{
-		Client:         mgr.GetClient(),
-		EventRecorder:  eventRecorder,
-		Metrics:        metrics,
-		Storage:        storage,
-		Getters:        getters,
-		ControllerName: controllerName,
-		Cache:          helmIndexCache,
-		TTL:            helmIndexCacheItemTTL,
-		CacheRecorder:  cacheRecorder,
-	}).SetupWithManagerAndOptions(mgr, controller.HelmRepositoryReconcilerOptions{
-		RateLimiter: helper.GetRateLimiter(rateLimiterOptions),
-	}); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", v1.HelmRepositoryKind)
-		os.Exit(1)
-	}
-
-	if err := (&controller.HelmChartReconciler{
-		Client:                  mgr.GetClient(),
-		RegistryClientGenerator: registry.ClientGenerator,
-		Storage:                 storage,
-		Getters:                 getters,
-		EventRecorder:           eventRecorder,
-		Metrics:                 metrics,
-		ControllerName:          controllerName,
-		Cache:                   helmIndexCache,
-		TTL:                     helmIndexCacheItemTTL,
-		CacheRecorder:           cacheRecorder,
-	}).SetupWithManagerAndOptions(ctx, mgr, controller.HelmChartReconcilerOptions{
-		RateLimiter: helper.GetRateLimiter(rateLimiterOptions),
-	}); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", v1.HelmChartKind)
-		os.Exit(1)
-	}
 
 	if err := (&controller.BucketReconciler{
 		Client:         mgr.GetClient(),
@@ -248,19 +157,6 @@ func main() {
 		RateLimiter: helper.GetRateLimiter(rateLimiterOptions),
 	}); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", v1.BucketKind)
-		os.Exit(1)
-	}
-
-	if err := (&controller.OCIRepositoryReconciler{
-		Client:         mgr.GetClient(),
-		Storage:        storage,
-		EventRecorder:  eventRecorder,
-		ControllerName: controllerName,
-		Metrics:        metrics,
-	}).SetupWithManagerAndOptions(mgr, controller.OCIRepositoryReconcilerOptions{
-		RateLimiter: helper.GetRateLimiter(rateLimiterOptions),
-	}); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", v1beta2.OCIRepositoryKind)
 		os.Exit(1)
 	}
 	// +kubebuilder:scaffold:builder
@@ -348,11 +244,7 @@ func mustSetupManager(metricsAddr, healthAddr string, maxConcurrent int,
 		},
 		Cache: ctrlcache.Options{
 			ByObject: map[ctrlclient.Object]ctrlcache.ByObject{
-				&v1.GitRepository{}:      {Label: watchSelector},
-				&v1.HelmRepository{}:     {Label: watchSelector},
-				&v1.HelmChart{}:          {Label: watchSelector},
-				&v1.Bucket{}:             {Label: watchSelector},
-				&v1beta2.OCIRepository{}: {Label: watchSelector},
+				&v1.Bucket{}: {Label: watchSelector},
 			},
 		},
 		Metrics: metricsserver.Options{
@@ -377,33 +269,6 @@ func mustSetupManager(metricsAddr, healthAddr string, maxConcurrent int,
 		os.Exit(1)
 	}
 	return mgr
-}
-
-func mustSetupHelmLimits(indexLimit, chartLimit, chartFileLimit int64) {
-	helm.MaxIndexSize = indexLimit
-	helm.MaxChartSize = chartLimit
-	helm.MaxChartFileSize = chartFileLimit
-}
-
-func mustInitHelmCache(maxSize int, itemTTL, purgeInterval string) (*cache.Cache, time.Duration) {
-	if maxSize <= 0 {
-		setupLog.Info("caching of Helm index files is disabled")
-		return nil, -1
-	}
-
-	interval, err := time.ParseDuration(purgeInterval)
-	if err != nil {
-		setupLog.Error(err, "unable to parse Helm index cache purge interval")
-		os.Exit(1)
-	}
-
-	ttl, err := time.ParseDuration(itemTTL)
-	if err != nil {
-		setupLog.Error(err, "unable to parse Helm index cache item TTL")
-		os.Exit(1)
-	}
-
-	return cache.New(maxSize, interval), ttl
 }
 
 func mustInitStorage(path string, storageAdvAddr string, artifactRetentionTTL time.Duration, artifactRetentionRecords int, artifactDigestAlgo string) *controller.Storage {

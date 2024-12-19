@@ -39,8 +39,6 @@ jobs:
           cluster_name: kind
       - name: Setup Kustomize
         uses: fluxcd/pkg/actions/kustomize@main
-      - name: Setup Helm
-        uses: fluxcd/pkg/actions/helm@main
       - name: Run E2E tests
         env:
           SKIP_COSIGN_VERIFICATION: true

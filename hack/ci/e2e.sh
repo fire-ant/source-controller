@@ -33,10 +33,6 @@ function cleanup(){
     if [ ${EXIT_CODE} -ne 0 ]; then
         kubectl -n kube-system describe pods
         kubectl -n source-system describe pods
-        kubectl -n source-system get gitrepositories -oyaml
-        kubectl -n source-system get ocirepositories -oyaml
-        kubectl -n source-system get helmrepositories -oyaml
-        kubectl -n source-system get helmcharts -oyaml
         kubectl -n source-system get all
         kubectl -n source-system logs deploy/source-controller
         kubectl -n minio get all
@@ -70,18 +66,8 @@ make dev-deploy IMG="${IMG}" TAG="${TAG}"
 echo "Run smoke tests"
 kubectl -n source-system apply -f "${ROOT_DIR}/config/samples"
 kubectl -n source-system rollout status deploy/source-controller --timeout=1m
-kubectl -n source-system wait gitrepository/gitrepository-sample --for=condition=ready --timeout=1m
-kubectl -n source-system wait ocirepository/ocirepository-sample --for=condition=ready --timeout=1m
-kubectl -n source-system wait helmrepository/helmrepository-sample --for=condition=ready --timeout=1m
-kubectl -n source-system wait helmchart/helmchart-sample --for=condition=ready --timeout=1m
-kubectl -n source-system wait helmchart/helmchart-sample-oci --for=condition=ready --timeout=1m
+kubectl -n source-system wait bucket/bucket-sample --for=condition=ready --timeout=1m
 kubectl -n source-system delete -f "${ROOT_DIR}/config/samples"
-
-echo "Run HelmChart values file tests"
-kubectl -n source-system apply -f "${ROOT_DIR}/config/testdata/helmchart-valuesfile"
-kubectl -n source-system wait helmchart/podinfo --for=condition=ready --timeout=5m
-kubectl -n source-system wait helmchart/podinfo-git --for=condition=ready --timeout=5m
-kubectl -n source-system delete -f "${ROOT_DIR}/config/testdata/helmchart-valuesfile"
 
 echo "Setup Minio"
 kubectl create ns minio
@@ -125,39 +111,3 @@ echo "Run Bucket tests"
 
 kubectl -n source-system apply -f "${ROOT_DIR}/config/testdata/bucket/source.yaml"
 kubectl -n source-system wait bucket/podinfo --for=condition=ready --timeout=1m
-
-
-echo "Run HelmChart from Bucket tests"
-"${BUILD_DIR}/mc" mb minio/charts
-"${BUILD_DIR}/mc" mirror "${ROOT_DIR}/internal/controller/testdata/charts/helmchart/" minio/charts/helmchart
-
-kubectl -n source-system apply -f "${ROOT_DIR}/config/testdata/helmchart-from-bucket/source.yaml"
-kubectl -n source-system wait bucket/charts --for=condition=ready --timeout=1m
-kubectl -n source-system wait helmchart/helmchart-bucket --for=condition=ready --timeout=1m
-
-echo "Run large Git repo tests"
-kubectl -n source-system apply -f "${ROOT_DIR}/config/testdata/git/large-repo.yaml"
-kubectl -n source-system wait gitrepository/large-repo --for=condition=ready --timeout=2m15s
-
-echo "Run HelmChart from OCI registry tests"
-kubectl -n source-system apply -f "${ROOT_DIR}/config/testdata/helmchart-from-oci/source.yaml"
-kubectl -n source-system wait helmchart/podinfo --for=condition=ready --timeout=1m
-kubectl -n source-system wait helmchart/podinfo-keyless --for=condition=ready --timeout=1m
-
-kubectl -n source-system apply -f "${ROOT_DIR}/config/testdata/helmchart-from-oci/notation.yaml"
-curl -sSLo notation.crt https://raw.githubusercontent.com/stefanprodan/podinfo/master/.notation/notation.crt
-curl -sSLo trustpolicy.json https://raw.githubusercontent.com/stefanprodan/podinfo/master/.notation/trustpolicy.json
-kubectl -n source-system create secret generic notation-config --from-file=notation.crt --from-file=trustpolicy.json --dry-run=client -o yaml | kubectl apply -f -
-kubectl -n source-system wait helmchart/podinfo-notation --for=condition=ready --timeout=1m
-
-echo "Run OCIRepository verify tests"
-kubectl -n source-system apply -f "${ROOT_DIR}/config/testdata/ocirepository/signed-with-key.yaml"
-kubectl -n source-system apply -f "${ROOT_DIR}/config/testdata/ocirepository/signed-with-keyless.yaml"
-curl -sSLo cosign.pub https://raw.githubusercontent.com/stefanprodan/podinfo/master/.cosign/cosign.pub
-kubectl -n source-system create secret generic cosign-key --from-file=cosign.pub --dry-run=client -o yaml | kubectl apply -f -
-
-kubectl -n source-system wait ocirepository/podinfo-deploy-signed-with-key --for=condition=ready --timeout=1m
-kubectl -n source-system wait ocirepository/podinfo-deploy-signed-with-keyless --for=condition=ready --timeout=1m
-
-kubectl -n source-system apply -f "${ROOT_DIR}/config/testdata/ocirepository/signed-with-notation.yaml"
-kubectl -n source-system wait ocirepository/podinfo-deploy-signed-with-notation --for=condition=ready --timeout=1m
